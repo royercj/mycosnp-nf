@@ -5,7 +5,8 @@ process PRE_MYCOSNP_INDV_SUMMARY {
     container 'staphb/ncbi-datasets:15.2.0'
 
     input:
-    tuple val(meta), path(assembly), path(faqcs), path(gambit), path(subtype)
+    //tuple val(meta), path(assembly), path(faqcs), path(gambit), path(subtype)
+    tuple val(meta), path(assembly), path(gambit), path(subtype)
 
     output:
     tuple val(meta), path("*_linesummary.csv"), emit: result

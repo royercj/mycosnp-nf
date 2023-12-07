@@ -5,7 +5,7 @@
 */
 
 def summary_params = NfcoreSchema.paramsSummaryMap(workflow, params)
-
+WorkflowMycosnp.initialise(params, log)
 // Check input path parameters to see if they exist
 def checkPathParamList = [ params.input, params.multiqc_config ] // params.snpeffdb
 if (params.skip_samples_file) { // check for skip_samples_file
@@ -88,11 +88,15 @@ ch_multiqc_custom_config = params.multiqc_config ? Channel.fromPath(params.multi
 include { SRA_FASTQ_SRATOOLS       } from '../subworkflows/local/sra_fastq_sratools'
 include { INPUT_CHECK              } from '../subworkflows/local/input_check'
 include { SEQKIT_PAIR              } from '../modules/nf-core/modules/seqkit/pair/main'
+include { SEQTK_SAMPLE_PREM        } from '../modules/local/seqtk_sample_prem.nf'
+include { DOWNSAMPLE_RATE_PREM     } from '../modules/local/downsample_rate_prem.nf'
 include { FAQCS                    } from '../modules/nf-core/modules/faqcs/main'
 include { GAMBIT_QUERY             } from '../modules/local/gambit'
 include { SUBTYPE                  } from '../modules/local/subtype'
 include { PRE_MYCOSNP_INDV_SUMMARY } from '../modules/local/pre_mycosnp_indv_summary'
 include { PRE_MYCOSNP_COMB_SUMMARY } from '../modules/local/pre_mycosnp_comb_summary'
+include { SOURMASH_WF              } from '../subworkflows/local/sourmash_wf'
+
 /*
 ========================================================================================
     IMPORT NF-CORE MODULES/SUBWORKFLOWS
@@ -139,7 +143,7 @@ workflow PRE_MYCOSNP_WF {
     if(params.add_sra_file)
     {   
         ch_sra_list = Channel.fromList(sra_list)
-                             .map{valid -> [ ['id':sra_ids[valid],single_end:false], valid ]}
+                            .map{valid -> [ ['id':sra_ids[valid],single_end:false], valid ]}
         SRA_FASTQ_SRATOOLS(ch_sra_list)
         ch_all_reads = ch_all_reads.mix(SRA_FASTQ_SRATOOLS.out.reads)
     }
@@ -151,18 +155,10 @@ workflow PRE_MYCOSNP_WF {
         )
         ch_all_reads = ch_all_reads.mix(INPUT_CHECK.out.reads)
         ch_versions = ch_versions.mix(INPUT_CHECK.out.versions)
-    }
-
+        }
+    
     //
-    // MODULE: Run Pre-FastQC 
-    //
-    FASTQC_RAW (
-        ch_all_reads
-    )
-    ch_versions = ch_versions.mix(FASTQC_RAW.out.versions.first())
-
-    //
-    // MODULE: Run seqkit to remove unpaired reads
+    //Module: SEQKIT_PAIR - remove unpaired reads
     //
     SEQKIT_PAIR(
         ch_all_reads
@@ -170,13 +166,37 @@ workflow PRE_MYCOSNP_WF {
     ch_versions = ch_versions.mix(SEQKIT_PAIR.out.versions.first())
 
     //
-    // MODULE: Run FAQCs - no downsampling option because a reference cannot be supplied before knowing the species
+    //Module: DOWNSAMPLE_RATE_PREM - get number of reads to downsample to 70X
     //
+    DOWNSAMPLE_RATE_PREM(
+        SEQKIT_PAIR.out.reads, 
+        params.fasta, 
+        70
+    )
+    
+    ch_seq_samplerate = SEQKIT_PAIR.out.reads.join(
+    DOWNSAMPLE_RATE_PREM.out.downsampled_rate.map{ meta, sr, snr -> [ meta, snr]}
+    )
+    
+    //
+    //Module: SEQTK_SAMPLE_PREM - downsample
+    //
+    SEQTK_SAMPLE_PREM(
+        ch_seq_samplerate, 
+        DOWNSAMPLE_RATE_PREM.out.number_to_sample
+    )
+    
+
+    //
+    //Module: FAQCS
+    //
+
     FAQCS(
-        SEQKIT_PAIR.out.reads
+        SEQTK_SAMPLE_PREM.out.reads
     )
     ch_versions = ch_versions.mix(FAQCS.out.versions.first())
-
+    
+        
     //
     // MODULE: Run SPAdes
     //
@@ -187,15 +207,27 @@ workflow PRE_MYCOSNP_WF {
         []
     )
     ch_versions = ch_versions.mix(SPADES.out.versions.first())
+    
 
     //
     // MODULE: Run seqtk seq to remove small contigs
     //
-
+    ch_spades_contigs = Channel.empty()
+    ch_spades_contigs = ch_spades_contigs.mix(SPADES.out.contigs)
     SEQTK_SEQ(
         SPADES.out.scaffolds
     )
     ch_versions = ch_versions.mix(SEQTK_SEQ.out.versions.first())
+
+    //
+    // SUBWORKFLOW: Run sourmash to compare outputs - CR
+    SOURMASH_WF(
+        ch_spades_contigs
+    )
+    ch_sourmash_report=Channel.empty()
+    ch_sourmash_report=ch_sourmash_report.mix(SOURMASH_WF.out.sm_report)
+    ch_versions    = ch_versions.mix(SOURMASH_WF.out.versions)
+    
 
     //
     // MODULE: Run Gambit
@@ -226,10 +258,11 @@ workflow PRE_MYCOSNP_WF {
     //
 
     // Combine trimmed reads and the QC reference into single channel
-    FAQCS.out.txt.map{ meta, txt -> [meta, txt] }.set{ ch_faqcs_txt }
+    //FAQCS.out.txt.map{ meta, txt -> [meta, txt] }.set{ ch_faqcs_txt }
     GAMBIT_QUERY.out.taxa.map{ meta, gambit -> [meta, gambit] }.set{ ch_gambit }
     SUBTYPE.out.subtype.map{ meta, subtype -> [meta, subtype] }.set{ ch_subtype }
-    SEQTK_SEQ.out.fastx.map{ meta, scaffolds -> [meta, scaffolds] }.join(ch_faqcs_txt).join(ch_gambit).join(ch_subtype).set{ ch_line_summary_input }
+    //SEQTK_SEQ.out.fastx.map{ meta, scaffolds -> [meta, scaffolds] }.join(ch_faqcs_txt).join(ch_gambit).join(ch_subtype).set{ ch_line_summary_input }
+    SEQTK_SEQ.out.fastx.map{ meta, scaffolds -> [meta, scaffolds] }.join(ch_gambit).join(ch_subtype).set{ ch_line_summary_input }
 
     PRE_MYCOSNP_INDV_SUMMARY(
         ch_line_summary_input
@@ -255,12 +288,14 @@ workflow PRE_MYCOSNP_WF {
     ch_multiqc_files = Channel.empty()
     ch_multiqc_files = ch_multiqc_files.mix(Channel.from(ch_multiqc_config))
     ch_multiqc_files = ch_multiqc_files.mix(ch_multiqc_custom_config.collect().ifEmpty([]))
+    ch_multiqc_files = ch_multiqc_files.mix(ch_sourmash_report.collect{it[0]}.ifEmpty([]))
     ch_multiqc_files = ch_multiqc_files.mix(ch_workflow_summary.collectFile(name: 'workflow_summary_mqc.yaml'))
     ch_multiqc_files = ch_multiqc_files.mix(CUSTOM_DUMPSOFTWAREVERSIONS.out.mqc_yml.collect())
-    ch_multiqc_files = ch_multiqc_files.mix(FASTQC_RAW.out.zip.collect{it[1]}.ifEmpty([]))
-
+    
+    
     MULTIQC (
-        ch_multiqc_files.collect()
+        ch_multiqc_files.collect(),
+        
     )
     multiqc_report = MULTIQC.out.report.toList()
     ch_versions    = ch_versions.mix(MULTIQC.out.versions)
